@@ -15,7 +15,35 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+
+def project_gaussian_means_to_2d(model: GaussianModel, gsplat_cam):
+    gaussians_pos = model.get_xyz
+    # N: Number of gaussian splats
+    N = gaussians_pos.shape[0]
+    # Shape (N, 1)
+    ones_padding = gaussians_pos.new_ones(N, 1)
+    # Shape (N, 4)
+    xyz_homogeneous = torch.cat([gaussians_pos, ones_padding], dim=1)
+    # Shape (N, 4, 1)
+    xyz_homogeneous = xyz_homogeneous.unsqueeze(-1)
+    # Shape (N, 4, 4)
+    cam_view_projection_matrix = gsplat_cam.full_proj_transform.T[None].expand(N, 4, 4)
+    # Shape (N, 4, 1)
+    transformed_xyz = cam_view_projection_matrix @ xyz_homogeneous
+    # Shape (N, 4)
+    transformed_xyz = transformed_xyz.squeeze(-1)
+    # Perform perspective division to obtain (N, 4) of [x_ndc, y_ndc, depth, 1.0]
+    transformed_xyz /= transformed_xyz[:, -1:]
+    return transformed_xyz
+
+
+def render(viewpoint_camera, pc : GaussianModel,
+           pipe,
+           bg_color : torch.Tensor,
+           scaling_modifier = 1.0,
+           override_color = None,
+           directional_light=None,
+           directional_light_intensity=None):
     """
     Render the scene. 
     
@@ -81,6 +109,51 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         colors_precomp = override_color
 
+    # Shadow mapping
+    gs_shadow_level = None
+    if directional_light is not None and directional_light_intensity is not None:
+        depth_tanfovx = math.tan(directional_light.FoVx * 0.5)
+        depth_tanfovy = math.tan(directional_light.FoVy * 0.5)
+        depth_raster_settings = GaussianRasterizationSettings(
+            image_height=int(directional_light.image_height),
+            image_width=int(directional_light.image_width),
+            tanfovx=depth_tanfovx,
+            tanfovy=depth_tanfovy,
+            bg=bg_color,
+            scale_modifier=scaling_modifier,
+            viewmatrix=directional_light.world_view_transform,
+            projmatrix=directional_light.full_proj_transform,
+            sh_degree=pc.active_sh_degree,
+            campos=directional_light.camera_center,
+            prefiltered=False,
+            debug=pipe.debug
+        )
+        shadow_rasterizer = GaussianRasterizer(raster_settings=depth_raster_settings)
+        _, _, shadowmap = shadow_rasterizer(
+            means3D=means3D,
+            means2D=means2D,
+            shs=shs,
+            colors_precomp=colors_precomp,
+            opacities=opacity,
+            scales=scales,
+            rotations=rotations,
+            cov3D_precomp=cov3D_precomp)
+
+        # light_coords_2d: (N, 4) of [x_ndc, y_ndc, depth, 1.0]
+        # TODO: (operel) - in the event this projection is inaccurate, can use the kaolin cam instead
+        gs_shadow_level = means3D.new_zeros([means3D.shape[0], 1])
+        gs_light_coords_2d = project_gaussian_means_to_2d(pc, directional_light)
+        # NDC to (H, W)
+        # Whatever falls within frustrum
+        masked_in = (gs_light_coords_2d[:, 0] <= 1.0) & \
+                    (gs_light_coords_2d[:, 0] >= -1.0) & \
+                    (gs_light_coords_2d[:, 1] <= 1.0) & \
+                    (gs_light_coords_2d[:, 1] >= -1.0)
+        gs_light_coords_2d = gs_light_coords_2d[masked_in]
+        gs_light_coords_2d[:, 0] = torch.round(((gs_light_coords_2d[:, 0] + 1.0) * 0.5) * directional_light.height)
+        gs_light_coords_2d[:, 1] = torch.round(((gs_light_coords_2d[:, 1] + 1.0) * 0.5) * directional_light.width)
+        gs_shadow_level[masked_in] = gs_light_coords_2d[:, 2] < shadowmap[gs_light_coords_2d[:, 0], gs_light_coords_2d[:, 1]]
+
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     rendered_image, radii, depth = rasterizer(
         means3D = means3D,
@@ -90,7 +163,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         opacities = opacity,
         scales = scales,
         rotations = rotations,
-        cov3D_precomp = cov3D_precomp)
+        cov3D_precomp = cov3D_precomp,
+        gs_shadow_level=gs_shadow_level,
+        directional_light_intensity=directional_light_intensity)
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
