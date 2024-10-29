@@ -141,7 +141,7 @@ def render(viewpoint_camera, pc: GaussianModel,
         if isinstance(directional_light, Camera):
             directional_light = [directional_light]
 
-        gs_shadow_level = means3D.new_ones([means3D.shape[0], 1])
+        gs_shadow_level = means3D.new_full([means3D.shape[0], 1], fill_value=len(directional_light))
 
         for dl in directional_light:
             depth_tanfovx = math.tan(dl.FoVx * 0.5)
@@ -189,8 +189,12 @@ def render(viewpoint_camera, pc: GaussianModel,
             gs_light_coords_2d[:, 0] = torch.clamp(gs_light_coords_2d[:, 0], 0, dl.image_height - 1)
             gs_light_coords_2d[:, 1] = torch.clamp(gs_light_coords_2d[:, 1], 0, dl.image_width - 1)
             gs_light_coords_2d = gs_light_coords_2d.long()
-            # TODO (operel): we convert it to binary but it can be a smooth value too
-            gs_shadow_level[masked_in, 0] = 1.0 - (gs_light_coords_2d[:, 2] <= shadowmap[gs_light_coords_2d[:, 0], gs_light_coords_2d[:, 1]]).float()
+            gs_shadow_level -= 1.0
+            gs_shadow_level[masked_in, 0] += (gs_light_coords_2d[:, 2] <= shadowmap[gs_light_coords_2d[:, 0], gs_light_coords_2d[:, 1]]).float()
+
+    gs_shadow_level /= len(directional_light)
+    gs_shadow_level = torch.clamp(gs_shadow_level * 3.0, 0.0, 1.0)
+    # gs_shadow_level[gs_shadow_level > (2/len(directional_light))] = 1.0
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
     rendered_image, radii, depth = rasterizer(
